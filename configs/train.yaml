@@ -1,0 +1,56 @@
+base_model: models/Mistral-7B-v0.1 #models/Mistral-7B-Instruct-v0.2 #models/Mistral-7B-v0.1
+#load:
+#  ckpt: /netscratch/bverma/results/acc_mistral_2048_truncate/epoch-0_step-649
+
+seed: 142
+patience: 20
+data:
+  prompt_type: train
+  mode: normal
+  reduce: False # this means that instance with length more than max_length will (or not) be used in experiments.
+  name: dataset_2
+
+tokenizer:
+  truncation: True
+  padding: max_length
+  max_length: 2048
+
+lora_config:
+  r: 32
+  lora_alpha: 64
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+    - lm_head
+  lora_dropout: 0.05
+
+
+training:
+  output_dir: /netscratch/bverma/results
+  run_name: acc_mistral_2048_truncate_dataset_2
+  max_steps: 1000
+  num_train_epochs: 2
+  batch_size: 2
+  optim:
+    learning_rate: 0.00005
+    weight_decay: 0.1
+    beta1: 0.9
+    beta2: 0.999
+    epsilon: 0.00000008
+
+aux:
+  hidden_size: 64
+  lr: 0.0001
+
+
+logger:
+  name: wandb
+  project: acc_llm
+  entity: bhuvi
+  dir: /netscratch/bverma/logs
+  mode: online
