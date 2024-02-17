@@ -1,36 +1,141 @@
 import argparse
 import os
-import random
-
-import bitsandbytes as bnb
-import numpy as np
+import csv
 import torch
-import torch.nn.functional as F
-import torch.optim as optim
+import numpy as np
+import random
 import wandb
 import yaml
+import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration
-from huggingface_hub import PyTorchModelHubMixin
-from peft import LoraConfig, get_peft_model, PeftModel
+from torch.utils.data import DataLoader, TensorDataset
+from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, get_linear_schedule_with_warmup, DataCollatorForSeq2Seq, \
+    BitsAndBytesConfig, AutoModelForCausalLM, DataCollatorForLanguageModeling, TrainingArguments, AutoModel, \
+    AutoModelForSequenceClassification
+
+from datasets import load_dataset
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from peft.utils.other import fsdp_auto_wrap_policy, prepare_model_for_kbit_training
+from tqdm import tqdm
+import torch.optim as optim
+from prepare_data import prepare
 from sklearn.metrics import (
     accuracy_score,
     f1_score,
     precision_score,
     recall_score,
+    classification_report
 )
+from torchtext.vocab import Vectors
+
+import bitsandbytes as bnb
 from torch import nn
-from torch.utils.data import DataLoader
-from tqdm import tqdm
-from transformers import AutoTokenizer, get_linear_schedule_with_warmup, BitsAndBytesConfig, AutoModelForCausalLM, \
-    DataCollatorForLanguageModeling, AutoModel
+from transformers import BertModel, BertTokenizer
 from transformers.trainer_pt_utils import get_parameter_names
+from accelerate.utils import ProjectConfiguration
+from huggingface_hub import PyTorchModelHubMixin
 
-from prepare_data import prepare
+import numpy as np
 
-with open('configs/train_1.yaml') as file:
+
+class Sampler(object):
+    """Base class for all Samplers.
+
+    Every Sampler subclass has to provide an __iter__ method, providing a way
+    to iterate over indices of dataset elements, and a __len__ method that
+    returns the length of the returned iterators.
+    """
+
+    def __init__(self, data_source):
+        pass
+
+    def __iter__(self):
+        raise NotImplementedError
+
+    def __len__(self):
+        raise NotImplementedError
+
+
+class StratifiedSampler(Sampler):
+    """Stratified Sampling
+
+    Provides equal representation of target classes in each batch
+    """
+
+    def __init__(self, class_vector, batch_size):
+        """
+        Arguments
+        ---------
+        class_vector : torch tensor
+            a vector of class labels
+        batch_size : integer
+            batch_size
+        """
+        self.n_splits = int(class_vector.size(0) / batch_size)
+        self.class_vector = class_vector
+
+    def gen_sample_array(self):
+        try:
+            from sklearn.model_selection import StratifiedShuffleSplit
+        except:
+            print('Need scikit-learn for this functionality')
+        import numpy as np
+
+        s = StratifiedShuffleSplit(n_splits=self.n_splits, test_size=0.5)
+        X = torch.randn(self.class_vector.size(0), 2).numpy()
+        y = self.class_vector.numpy()
+        s.get_n_splits(X, y)
+
+        train_index, test_index = next(s.split(X, y))
+        return np.hstack([train_index, test_index])
+
+    def __iter__(self):
+        return iter(self.gen_sample_array())
+
+    def __len__(self):
+        return len(self.class_vector)
+
+
+with open('configs/train_minmax.yaml') as file:
     config_data = yaml.safe_load(file)
+
+# Replace 'path/to/glove.6B.300d.txt' with the actual path to your downloaded GloVe file
+glove_path = '/ds/models/embedding_models/glove.6B.300d.txt'
+
+# Load GloVe embeddings from the specified file
+glove_vectors = Vectors(name=glove_path)
+
+
+# Tokenizer
+# tokenizer = torchtext.data.utils.get_tokenizer('basic_english')
+
+def get_glove_embeddings(inputs, tokenizer):
+    # Assuming 'input_ids' in inputs is the tokenized version of the sentences
+    # Convert tokenized sentences to list of words
+    # sentences = [tokenizer.decode(ids) for ids in inputs['input_ids'].tolist()]
+
+    # Get GloVe embeddings for each word in the sentences
+    # embeddings = [glove_vectors[word] for sentence in sentences for word in sentence.split()]
+
+    # embeddings = [glove_vectors[word] for ids in inputs['input_ids'].tolist() for word in tokenizer.decode(ids)]
+    embeddings = []
+    for ids in inputs['input_ids'].tolist():
+        res = []
+        for word in tokenizer.decode(ids).split():
+            if word == '[PAD]':
+                continue
+            res.append(glove_vectors[word])
+        res = torch.stack(res).mean(dim=0)
+        embeddings.append(res),
+
+    # Reshape to match the batch size and sequence length
+    embeddings = torch.stack(embeddings).view(inputs['input_ids'].shape[0], 300).to('cuda')
+    # Create one-hot encoded labels
+    # labels_onehot = torch.eye(2).to('cuda')[inputs['label'].squeeze(0)]  # Assumes 'label' is a tensor of shape (batch_size,)
+    labels_oh = torch.zeros(embeddings.shape[0], 2).to('cuda').scatter_(1, inputs['label'].unsqueeze(1), 1)
+
+    embeddings = torch.cat((embeddings, labels_oh), dim=1)
+    return embeddings
 
 
 class EarlyStoppingCallback:
@@ -54,46 +159,35 @@ class EarlyStoppingCallback:
         return False
 
 
-class Auxiliary(nn.Module, PyTorchModelHubMixin):
-    def __init__(self, hidden_dim=256):
-        super(Auxiliary, self).__init__()
-        # self.embedding_layer = nn.Embedding(300, 768)  # Assuming GloVe embeddings size 300
-        self.model = AutoModel.from_pretrained("models/SGPT-125M-weightedmean-nli-bitfit")
-        self.mlp = nn.Sequential(
-            nn.Linear(768, hidden_dim),
-            nn.Tanh(),
-            nn.Linear(hidden_dim, 1)
-        )
+class AuxiliaryModel(nn.Module, PyTorchModelHubMixin):
+    def __init__(self, hidden_size_1, hidden_size_2, hidden_size_3, output_size=1, input_size=300, num_labels=2, ):
+        super(AuxiliaryModel, self).__init__()
+        self.layer1 = nn.Linear(input_size + num_labels, hidden_size_1)
+        next_size = hidden_size_1
+        self.layer2 = None
+        if hidden_size_2 != 0:
+            self.layer2 = nn.Linear(hidden_size_1, hidden_size_2)
+            next_size = hidden_size_2
+            self.layer3 = None
+            if hidden_size_3 != 0:
+                self.layer3 = nn.Linear(hidden_size_2, hidden_size_3)
+                next_size = hidden_size_3
+        self.activation = nn.Tanh()
+        self.layer4 = nn.Linear(next_size, output_size)  # Concatenate labels to the input
 
-    def forward(self, input_ids, attention_mask, y):
-        outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True,
-                             return_dict=True)
-        last_hidden_state = outputs['last_hidden_state']
-        # Get weights of shape [bs, seq_len, hid_dim]
-        weights = (
-            torch.arange(start=1, end=last_hidden_state.shape[1] + 1)
-            .unsqueeze(0)
-            .unsqueeze(-1)
-            .expand(last_hidden_state.size())
-            .float().to(last_hidden_state.device)
-        )
+    def forward(self, x):
+        # Concatenate labels to the input
+        # x = torch.cat([x, labels.reshape(1,-1)], dim=1)
 
-        # Get attn mask of shape [bs, seq_len, hid_dim]
-        input_mask_expanded = (
-            attention_mask
-            .unsqueeze(-1)
-            .expand(last_hidden_state.size())
-            .float()
-        )
-
-        # Perform weighted mean pooling across seq_len: bs, seq_len, hidden_dim -> bs, hidden_dim
-        sum_embeddings = torch.sum(last_hidden_state * input_mask_expanded * weights, dim=1)
-        sum_mask = torch.sum(input_mask_expanded * weights, dim=1)
-
-        embeddings = sum_embeddings / sum_mask
-        # pooled_output = outputs['pooler_output']
-        x = self.mlp(embeddings)
-        # combined_input = torch.cat((x, y), dim=1)
+        x = self.layer1(x)
+        x = self.activation(x)
+        if self.layer2 is not None:
+            x = self.layer2(x)
+            x = self.activation(x)
+            if self.layer3 is not None:
+                x = self.layer3(x)
+                x = self.activation(x)
+        x = self.layer4(x)
         return x
 
 
@@ -154,7 +248,7 @@ def remove_large_samples(tokenizer, dataset, max_length):
         if len(data['input_ids']) > max_length:
             exclude_idx.append(i)
 
-    # create new dataset exluding those idx
+    # create new dataset excluding those idx
     new_dataset = dataset.select(
         (
             i for i in range(len(dataset))
@@ -192,11 +286,22 @@ def train():
     )
     accelerator = Accelerator(mixed_precision="bf16", project_config=project_config)
 
-    train_dataset = prepare(split=f"{config_data['data']['name']}.json", prompt_type=wandb.config['prompt_type'],
-                            mode=config_data['data']['mode'])
-    val_dataset = prepare(split='dev.json', prompt_type=wandb.config['prompt_type'], mode=config_data['data']['mode'])
+    train_dataset = prepare(split=f"{config_data['data']['train_name']}.json",
+                            prompt_type=config_data['data']['prompt_type'])
+    # train_dataset = prepare_bionli(prompt_type=config_data['data']['prompt_type'])
+    val_dataset = prepare(split=f"{config_data['data']['val_name']}.json",
+                          prompt_type='eval')
 
-    base_model = wandb.config['base_model']
+    e = [i for i, l in enumerate(train_dataset['label_cls']) if l == 0]
+    c = [i for i, l in enumerate(train_dataset['label_cls']) if l == 1]
+    a = random.sample(e, 200) + random.sample(c, 200)
+    random.shuffle(a)
+
+    train_dataset = train_dataset.select(a)
+
+    base_model = config_data['base_model']
+    label2id = {label: i for i, label in enumerate(list(set(train_dataset['label'])))}
+    id2label = {i: label for label, i in label2id.items()}
 
     # BitsAndBytesConfig int-4 config
     bnb_config = BitsAndBytesConfig(
@@ -213,6 +318,7 @@ def train():
         device_map="auto",
         use_flash_attention_2=False,
     )
+    # model.config.pad_token_id = model.config.eos_token_id
     model.gradient_checkpointing_enable()
     model = prepare_model_for_kbit_training(model)
     # model.config.pretraining_tp = 1
@@ -251,8 +357,8 @@ def train():
         train_tokenized_datasets = train_dataset.map(
             tokenize_function,
             batched=True,
-            remove_columns=["label", 'text'],
-            fn_kwargs={'max_length': int(wandb.config['max_length']),
+            remove_columns=["label", 'text', 'id_'],
+            fn_kwargs={'max_length': int(config_data['tokenizer']['max_length']),
                        'tokenizer': tokenizer, "padding": config_data['tokenizer']['padding'],
                        "truncation": config_data['tokenizer']['truncation']}
         )
@@ -260,15 +366,17 @@ def train():
         val_tokenized_datasets = val_dataset.map(
             tokenize_function,
             batched=True,
-            remove_columns=["label", 'text'],
-            fn_kwargs={'max_length': int(wandb.config['max_length']),
+            remove_columns=["label", 'text', 'id_'],
+            fn_kwargs={'max_length': int(config_data['tokenizer']['max_length']),
                        'tokenizer': tokenizer, "padding": config_data['tokenizer']['padding'],
                        "truncation": config_data['tokenizer']['truncation']}
         )
 
     data_collator = DataCollatorForLanguageModeling(tokenizer, mlm=False)
+    y = torch.tensor(train_tokenized_datasets['label_cls'])
+    sampler = StratifiedSampler(class_vector=y, batch_size=batch_size)
     train_dataloader = DataLoader(
-        train_tokenized_datasets, shuffle=True, collate_fn=data_collator, batch_size=batch_size, pin_memory=True
+        train_tokenized_datasets, sampler=sampler, collate_fn=data_collator, batch_size=batch_size, pin_memory=True
     )
     eval_dataloader = DataLoader(
         val_tokenized_datasets, collate_fn=data_collator, batch_size=batch_size, pin_memory=True
@@ -282,7 +390,12 @@ def train():
         num_training_steps=(len(train_dataloader) * num_epochs),
     )
 
-    auxiliary_model = Auxiliary(hidden_dim=wandb.config['aux_hidden_size'])
+    # auxiliary_model = Auxiliary(hidden_dim=wandb.config['aux_hidden_size'])
+    auxiliary_model = AuxiliaryModel(
+        hidden_size_1=wandb.config['aux_hidden_size1'],
+        hidden_size_2=wandb.config['aux_hidden_size2'],
+        hidden_size_3=wandb.config['aux_hidden_size3'])
+
     auxiliary_optimizer = optim.Adam(auxiliary_model.parameters(), lr=wandb.config['aux_lr'])
 
     if getattr(accelerator.state, "fsdp_plugin", None) is not None:
@@ -295,21 +408,36 @@ def train():
     callback = EarlyStoppingCallback(patience=wandb.config['patience'])
     overall_step = 0
     best_vloss = 1000
-    best_run = {'epoch': 0, 'step': 0, 'vloss': 1000}
+    best_f1 = 0
+    best_run = {'epoch': 0, 'step': 0, 'f1': 0}
     for epoch in range(num_epochs):
         print(f'Epoch: {epoch}')
+        # If so, we break the loop
+        if accelerator.check_trigger():
+            print('Ran out of patience')
+            break
         learner.train()
         running_loss = 0
         last_loss = 0
         for step, batch in enumerate(tqdm(train_dataloader)):
-            input_ids_batch, attention_mask_batch, labels_batch = batch
+            # If so, we break the loop
+            if accelerator.check_trigger():
+                print('Ran out of patience')
+                break
+            # input_ids_batch, attention_mask_batch, labels_batch = batch
+            input_ids_batch = batch['input_ids']
+            attention_mask_batch = batch['attention_mask']
+            labels_batch = batch['label_cls']
 
-            weights = auxiliary_model(batch['input_ids'], batch['attention_mask'], batch['labels'])
+            inputs_example = {'input_ids': input_ids_batch, 'label': labels_batch}
+
+            glove_embeddings = get_glove_embeddings(inputs_example, tokenizer)
+            weights = auxiliary_model(glove_embeddings)
             weights = F.sigmoid(weights)
             weights = weights / weights.mean()
             weights = weights + 1
 
-            outputs = learner(**batch)
+            outputs = learner(input_ids=input_ids_batch, attention_mask=attention_mask_batch, labels=batch['labels'])
             loss = outputs.loss
             learner_loss = torch.mean(weights.detach() * loss)
 
@@ -331,60 +459,76 @@ def train():
                 optimizer.zero_grad()
                 auxiliary_optimizer.zero_grad()
 
-            if (step + 1) % 25 == 0:
-                overall_step = +25
-                last_loss = running_loss / 25
-                running_loss = 0
-                # accelerator.save_state(output_dir=f'{output_dir}/epoch-{epoch}_step-{step+1}')
-                slearner = accelerator.unwrap_model(learner)
-                slearner.save_pretrained(f'{output_dir}/learner/epoch-{epoch}_step-{step + 1}')
-                saux = accelerator.unwrap_model(auxiliary_model)
-                saux.save_pretrained(f'{output_dir}/aux/epoch-{epoch}_step-{step + 1}')
-                learner.eval()
-                runnning_vloss = 0
-                for e_step, e_batch in enumerate(tqdm(eval_dataloader)):
-                    with torch.no_grad():
-                        outputs = learner(**e_batch)
-                    e_loss = outputs.loss
-                    runnning_vloss += e_loss.detach().float()
-                avg_eval_loss = runnning_vloss / (e_step + 1)
-                if avg_eval_loss < best_vloss:
-                    best_vloss = avg_eval_loss
-                    best_run = {'epoch': epoch, 'step': step, 'vloss': best_vloss}
+        last_loss = running_loss / step
 
-                print(f'Step: {step + 1} Avg Train Loss: {last_loss} Avg Eval Loss: {avg_eval_loss}')
-                learner.train()
-                wandb.log(
-                    {
-                        # "epoch": epoch,
-                        "step": overall_step,
-                        # "train_loss": learner_loss,
-                        "train_avg_loss": last_loss,
-                        # "val_loss": e_loss,
-                        "val_avg_loss": avg_eval_loss,
-                    }
-                )
-                # Check if we should stop the training on any processes
-                if callback.check_early_stopping(avg_eval_loss):
-                    accelerator.set_trigger()
+        learner.eval()
+        runnning_vloss = 0
+        preds = []
+        golds = []
+        for e_step, e_batch in enumerate(tqdm(eval_dataloader)):
+            with torch.no_grad():
+                input_ids_batch = e_batch['input_ids']
+                attention_mask_batch = e_batch['attention_mask']
+                labels_batch = e_batch['label_cls']
+                outputs = learner(input_ids=input_ids_batch, attention_mask=attention_mask_batch,
+                                  labels=e_batch['labels'])
+                probs = torch.softmax(outputs['logits'].detach().cpu(), dim=2)
+                toks = torch.argmax(probs, dim=2)
+                golds.extend([id2label[int(g)] for g in e_batch['label_cls']])
+                for o, t in enumerate(toks):
+                    s = tokenizer.decode(t)
+                    s = s.split('### Response:')
+                    if len(s) != 0:
+                        s = s[-1]
+                        if 'yes' in s.lower():
+                            preds.append(id2label[0])
+                        elif 'no' in s.lower():
+                            preds.append(id2label[1])
+                        else:
+                            if int(e_batch['label_cls'][o]) == 0:
+                                preds.append(id2label[1])
+                            else:
+                                preds.append(id2label[0])
+                    else:
+                        if int(e_batch['label_cls'][o]) == 0:
+                            preds.append(id2label[1])
+                        else:
+                            preds.append(id2label[0])
 
-                # If so, we break the loop
-                if accelerator.check_trigger():
-                    print('Ran out of patience')
-                    break
+            e_loss = outputs.loss
+            runnning_vloss += e_loss.detach().float()
+        avg_eval_loss = runnning_vloss / (e_step + 1)
 
-        print(f'Epoch: {epoch} Training Loss: {last_loss} Evaluation Loss: {avg_eval_loss}')
+        scores = compute_metrics_decoded(golds, preds)
+        f1_score = scores['macro_f1']
+        print(classification_report(golds, preds))
+        if f1_score > best_f1:
+            best_f1 = f1_score
+            best_run = {'epoch': epoch, 'step': step, 'f1': best_f1}
 
+        # print(f'Step: {step+1} Avg Train Loss: {last_loss} Avg Eval Loss: {avg_eval_loss} Val F1 Macro: {f1_score}')
+        learner.train()
         wandb.log(
             {
-                "epoch": epoch,
-                # "step": step,
-                # "total_train_loss": loss,
-                "train_loss": last_loss,
+                # "epoch": epoch,
+                "step": overall_step,
+                # "train_loss": learner_loss,
+                "train_avg_loss": last_loss,
                 # "val_loss": e_loss,
-                "val_loss": avg_eval_loss,
+                "val_avg_loss": avg_eval_loss,
+                "macro_f1": f1_score,
             }
         )
+        # Check if we should stop the training on any processes
+        if callback.check_early_stopping(avg_eval_loss):
+            accelerator.set_trigger()
+
+        # If so, we break the loop
+        if accelerator.check_trigger():
+            print('Ran out of patience')
+            break
+
+        print(f'Epoch: {epoch} Training Loss: {last_loss} Evaluation Loss: {avg_eval_loss} Evaluation F1: {f1_score}')
     print(f'Best Configuration: \n {best_run}')
 
 

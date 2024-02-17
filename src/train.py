@@ -166,7 +166,7 @@ def train(config_data):
         train_tokenized_datasets = train_dataset.map(
             tokenize_function,
             batched=True,
-            remove_columns=["label", 'text'],
+            remove_columns=["label", 'text', 'id_'],
             fn_kwargs={'max_length': int(config_data['tokenizer']['max_length']),
                        'tokenizer': tokenizer, "padding": config_data['tokenizer']['padding'],
                        "truncation": config_data['tokenizer']['truncation']}
@@ -177,7 +177,7 @@ def train(config_data):
         val_tokenized_datasets = val_dataset.map(
             tokenize_function,
             batched=True,
-            remove_columns=["label", 'text'],
+            remove_columns=["label", 'text', 'id_'],
             fn_kwargs={'max_length': int(config_data['tokenizer']['max_length']),
                        'tokenizer': tokenizer, "padding": config_data['tokenizer']['padding'],
                        "truncation": config_data['tokenizer']['truncation']}

@@ -1,13 +1,12 @@
-base_model: models/Mistral-7B-v0.1
-#load:
-#  ckpt: path/to/trained_model
+base_model: models/Mistral-7B-v0.1 #models/Mistral-7B-Instruct-v0.2 #models/Mistral-7B-v0.1
+
 
 seed: 142
 patience: 100
 data:
   prompt_type: train
   mode: normal
-  reduce: False # if True means that instance with length more than max_length will be removed
+  reduce: False
   train_name: train
   val_name: dev
 
@@ -34,27 +33,26 @@ lora_config:
 training:
   no_val: False
   output_dir: /netscratch/bverma/results
-  run_name: acc_minmax_ft_mistral_4096_truncate_mednli_ft_acr_num_pert
+  run_name: inference
   max_steps: 1000
-  num_train_epochs: 1
-  batch_size: 4
+  num_train_epochs: 3
+  batch_size: 2
+  #patience: 7 # means 7 evaluation cycles
   optim:
-    learning_rate: 0.00003309975242256577
+    learning_rate: 0.00005
     weight_decay: 0.1
     beta1: 0.9
     beta2: 0.999
     epsilon: 0.00000008
 
 aux:
-  hidden_size_1: 1024
-  hidden_size_2: 64
-  hidden_size_3: 0
-  lr: 0.0057898618386397985
+  hidden_size: 64
+  lr: 0.0001
 
 
 logger:
   name: wandb
-  project: minmax
+  project: acc_llm
   entity: bhuvi
   dir: /netscratch/bverma/logs
-  mode: online
+  mode: offline
