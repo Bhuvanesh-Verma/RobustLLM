@@ -1,5 +1,5 @@
 # RobustLLM
-Code Repository for the SemEval-2024 Task 2: Safe Biomedical Natural 
+Code Repository for the system submitted by Team DFKI-NLP at the SemEval-2024 Task 2: Safe Biomedical Natural 
 Language Inference for Clinical Trials.
 
 
